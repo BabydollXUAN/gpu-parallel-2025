@@ -1,0 +1,18 @@
+# build outputs
+build/
+*/build/
+*.o
+*.obj
+*.exe
+*.out
+
+.vscode/
+.idea/
+*.user
+*.sln
+*.vcxproj*
+.DS_Store
+Thumbs.db
+
+data/raw/*
+data/tmp/*
