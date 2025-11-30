@@ -49,7 +49,7 @@ void cpu_dft(const cufftComplex* in, cufftComplex* out, int N) {
 }
 
 int main(int argc, char** argv) {
-    if (argc < 1 + 1) {
+    if (argc < 2) {
         std::fprintf(stderr, "Usage: %s <N>\n", argv[0]);
         return EXIT_FAILURE;
     }
@@ -79,20 +79,29 @@ int main(int argc, char** argv) {
         h_in[i].y = 0.0f;                                      // 虚部设为 0
     }
 
-    // ----------------- 2. CPU 端 DFT 计时 -----------------
-    auto t0 = std::chrono::high_resolution_clock::now();
-    cpu_dft(h_in.data(), h_cpu_out.data(), N);
-    auto t1 = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double, std::milli> cpu_ms = t1 - t0;
+    // ----------------- 2. CPU 端 DFT，多次运行取最好时间 -----------------
+    int cpu_runs = 3;
+    double cpu_best_ms = 1e100;
 
-    std::printf("[CPU DFT ] time = %.3f ms\n", cpu_ms.count());
+    for (int r = 0; r < cpu_runs; ++r) {
+        auto t0 = std::chrono::high_resolution_clock::now();
+        cpu_dft(h_in.data(), h_cpu_out.data(), N);
+        auto t1 = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double, std::milli> dt = t1 - t0;
+        cpu_best_ms = std::min(cpu_best_ms, dt.count());
+    }
 
-    // ----------------- 3. GPU 端 cuFFT -----------------
-    cufftComplex* d_data = nullptr;
-    CHECK_CUDA(cudaMalloc(&d_data, sizeof(cufftComplex) * N));
+    std::printf("[CPU DFT ] best time over %d runs = %.3f ms\n",
+                cpu_runs, cpu_best_ms);
 
-    // 拷贝输入到 GPU
-    CHECK_CUDA(cudaMemcpy(d_data, h_in.data(),
+    // ----------------- 3. GPU 端 cuFFT（out-of-place） -----------------
+    cufftComplex* d_in  = nullptr;
+    cufftComplex* d_out = nullptr;
+    CHECK_CUDA(cudaMalloc(&d_in,  sizeof(cufftComplex) * N));
+    CHECK_CUDA(cudaMalloc(&d_out, sizeof(cufftComplex) * N));
+
+    // 拷贝输入到 GPU（输入缓冲区 d_in 只读使用）
+    CHECK_CUDA(cudaMemcpy(d_in, h_in.data(),
                           sizeof(cufftComplex) * N,
                           cudaMemcpyHostToDevice));
 
@@ -103,22 +112,31 @@ int main(int argc, char** argv) {
     CHECK_CUDA(cudaEventCreate(&start));
     CHECK_CUDA(cudaEventCreate(&stop));
 
-    // 计时 cuFFT
+    int gpu_runs = 10;
+
+    // 先 warmup 一次，不计时
+    CHECK_CUFFT(cufftExecC2C(plan, d_in, d_out, CUFFT_FORWARD));
+    CHECK_CUDA(cudaDeviceSynchronize());
+
+    // 正式计时：每次都从同一个 d_in 读，d_out 被覆盖
     CHECK_CUDA(cudaEventRecord(start));
-    CHECK_CUFFT(cufftExecC2C(plan, d_data, d_data, CUFFT_FORWARD));
+    for (int r = 0; r < gpu_runs; ++r) {
+        CHECK_CUFFT(cufftExecC2C(plan, d_in, d_out, CUFFT_FORWARD));
+    }
     CHECK_CUDA(cudaEventRecord(stop));
     CHECK_CUDA(cudaEventSynchronize(stop));
 
-    float gpu_ms = 0.0f;
-    CHECK_CUDA(cudaEventElapsedTime(&gpu_ms, start, stop));
+    float gpu_ms_total = 0.0f;
+    CHECK_CUDA(cudaEventElapsedTime(&gpu_ms_total, start, stop));
+    float gpu_ms_avg = gpu_ms_total / gpu_runs;
 
-    // 将结果拷回主机
-    CHECK_CUDA(cudaMemcpy(h_gpu_out.data(), d_data,
+    // 将最后一次 FFT 结果拷回主机
+    CHECK_CUDA(cudaMemcpy(h_gpu_out.data(), d_out,
                           sizeof(cufftComplex) * N,
                           cudaMemcpyDeviceToHost));
 
     // ----------------- 4. 计算 Speedup 与误差 -----------------
-    double speedup = cpu_ms.count() / gpu_ms;
+    double speedup = cpu_best_ms / gpu_ms_avg;
 
     // 计算最大误差（欧氏范数）
     float max_err = 0.0f;
@@ -129,15 +147,17 @@ int main(int argc, char** argv) {
         if (err > max_err) max_err = err;
     }
 
-    std::printf("[GPU cuFFT] time = %.3f ms\n", gpu_ms);
+    std::printf("[GPU cuFFT] avg time over %d runs = %.3f ms\n",
+                gpu_runs, gpu_ms_avg);
     std::printf("Speedup S_p = %.3f\n", speedup);
-    std::printf("Max abs diff between CPU DFT and GPU FFT = %.6f\n", max_err);
+    std::printf("Max abs diff between CPU DFT and GPU FFT = %.6e\n", max_err);
 
     // ----------------- 5. 清理资源 -----------------
     CHECK_CUFFT(cufftDestroy(plan));
     CHECK_CUDA(cudaEventDestroy(start));
     CHECK_CUDA(cudaEventDestroy(stop));
-    CHECK_CUDA(cudaFree(d_data));
+    CHECK_CUDA(cudaFree(d_in));
+    CHECK_CUDA(cudaFree(d_out));
 
     return 0;
 }
