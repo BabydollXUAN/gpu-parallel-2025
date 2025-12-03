@@ -16,3 +16,11 @@ Thumbs.db
 
 data/raw/*
 data/tmp/*
+
+# IPM project outputs
+project/ipm_cuda/input.pgm
+project/ipm_cuda/input_preview.png
+project/ipm_cuda/ipm_cpu.pgm
+project/ipm_cuda/ipm_gpu.pgm
+project/ipm_cuda/ipm_gpu_sobel.png
+
