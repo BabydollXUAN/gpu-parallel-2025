@@ -148,18 +148,19 @@ void generate_synthetic_road(float *img, int W, int H) {
 // 这些系数是我提前用 4 对对应点算好的，假设输入大小 640x480、输出同尺寸。
 __constant__ float d_Hinv[9];
 
+
+
 // __host__ void get_Hinv_host(float Hinv[9]) {
 //     // row-major: h00, h01, h02, h10, h11, h12, h20, h21, h22
-//     Hinv[0] = -0.328125f;  Hinv[1] =  0.2916667f; Hinv[2] = -175.0f;
-//     Hinv[3] =  0.0f;       Hinv[4] =  0.1276042f; Hinv[5] = -262.5f;
-//     Hinv[6] =  0.0f;       Hinv[7] =  0.00091146f;Hinv[8] = -0.875f;
+//     Hinv[0] = -0.6538462f;   Hinv[1] =  0.7005495f;   Hinv[2] = -336.2637363f;
+//     Hinv[3] =  0.0f;         Hinv[4] =  0.3969780f;   Hinv[5] = -471.7032967f;
+//     Hinv[6] =  0.0f;         Hinv[7] =  0.0023352f;   Hinv[8] = -1.7747253f;
 // }
-
 __host__ void get_Hinv_host(float Hinv[9]) {
-    // row-major: h00, h01, h02, h10, h11, h12, h20, h21, h22
-    Hinv[0] = -0.6538462f;   Hinv[1] =  0.7005495f;   Hinv[2] = -336.2637363f;
-    Hinv[3] =  0.0f;         Hinv[4] =  0.3969780f;   Hinv[5] = -471.7032967f;
-    Hinv[6] =  0.0f;         Hinv[7] =  0.0023352f;   Hinv[8] = -1.7747253f;
+    // 这里的数值是你刚刚用 Python 算出来的真实路面参数
+    Hinv[0] = 0.25004793f; Hinv[1] = -0.63625292f; Hinv[2] = 265.65849615f;
+    Hinv[3] = 0.02820959f; Hinv[4] = -0.39842684f; Hinv[5] = 210.47166917f;
+    Hinv[6] = 0.00011805f; Hinv[7] = -0.00193882f; Hinv[8] = 1.00000000f;
 }
 
 
