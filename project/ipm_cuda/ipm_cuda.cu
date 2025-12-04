@@ -19,15 +19,10 @@
         }                                                                  \
     } while (0)
 
-// ----------------- 简单 PGM 存图 -----------------
-void save_pgm(const std::string &filename,
-              const float *img, int W, int H) {
+// ----------------- PGM 图像读写辅助函数 -----------------
+void save_pgm(const std::string &filename, const float *img, int W, int H) {
     FILE *f = std::fopen(filename.c_str(), "wb");
-    if (!f) {
-        std::perror("fopen");
-        return;
-    }
-    // P5 = binary gray
+    if (!f) return;
     std::fprintf(f, "P5\n%d %d\n255\n", W, H);
     for (int i = 0; i < W * H; ++i) {
         float v = img[i];
@@ -37,326 +32,250 @@ void save_pgm(const std::string &filename,
     }
     std::fclose(f);
 }
-// ----------------- 读取 PGM 到 float [0,1] -----------------
-bool load_pgm(const std::string &filename,
-              std::vector<float> &img,
-              int &W, int &H) {
+
+bool load_pgm(const std::string &filename, std::vector<float> &img, int &W, int &H) {
     FILE *f = std::fopen(filename.c_str(), "rb");
     if (!f) {
         std::perror("fopen");
         return false;
     }
-
     char magic[3] = {0};
-    if (std::fscanf(f, "%2s", magic) != 1) {
-        std::fprintf(stderr, "Failed to read magic from %s\n", filename.c_str());
-        std::fclose(f);
-        return false;
-    }
-    if (std::string(magic) != "P5") {
-        std::fprintf(stderr, "%s is not P5 PGM (magic=%s)\n",
-                     filename.c_str(), magic);
-        std::fclose(f);
-        return false;
-    }
-
-    // 跳过注释行
+    if (std::fscanf(f, "%2s", magic) != 1) return false;
+    // 跳过注释
     int c = std::fgetc(f);
     while (c == '#') {
-        while (c != '\n' && c != EOF) {
-            c = std::fgetc(f);
-        }
+        while (c != '\n' && c != EOF) c = std::fgetc(f);
         c = std::fgetc(f);
     }
     std::ungetc(c, f);
-
-    int maxval = 255;
-    if (std::fscanf(f, "%d %d", &W, &H) != 2) {
-        std::fprintf(stderr, "Failed to read width/height from %s\n", filename.c_str());
-        std::fclose(f);
-        return false;
-    }
-    if (std::fscanf(f, "%d", &maxval) != 1) {
-        std::fprintf(stderr, "Failed to read maxval from %s\n", filename.c_str());
-        std::fclose(f);
-        return false;
-    }
-
-    // 吃掉一个换行
-    std::fgetc(f);
-
+    int maxval;
+    if (std::fscanf(f, "%d %d %d", &W, &H, &maxval) != 3) return false;
+    std::fgetc(f); // skip newline
     std::vector<unsigned char> buf(W * H);
-    size_t n = std::fread(buf.data(), 1, W * H, f);
+    if (std::fread(buf.data(), 1, W * H, f) != (size_t)(W * H)) return false;
     std::fclose(f);
-    if (n != (size_t)(W * H)) {
-        std::fprintf(stderr, "PGM data size mismatch in %s\n", filename.c_str());
-        return false;
-    }
-
     img.resize(W * H);
     float scale = 1.0f / (float)maxval;
-    for (int i = 0; i < W * H; ++i) {
-        img[i] = buf[i] * scale;
-    }
+    for (int i = 0; i < W * H; ++i) img[i] = buf[i] * scale;
     return true;
 }
 
-
-
-// ----------------- 生成合成道路场景 -----------------
-// 分辨率 640x480：底部宽、上部窄的车道，带两条亮车道线
-void generate_synthetic_road(float *img, int W, int H) {
-    std::fill(img, img + W * H, 0.0f);
-
-    // 定义“远处车道上边缘”和“近处车道下边缘”的四个顶点
-    // 这些点跟我们预先算好的 H 对应着（大概是个梯形车道）
-    float top_y    = 300.0f;
-    float bottom_y = 480.0f;
-    float top_left_x   = 260.0f;
-    float top_right_x  = 380.0f;
-    float bottom_left_x  = 200.0f;
-    float bottom_right_x = 440.0f;
-
-    for (int y = 0; y < H; ++y) {
-        for (int x = 0; x < W; ++x) {
-            float val = 0.0f;
-
-            if (y >= top_y && y <= bottom_y) {
-                float t = (y - top_y) / (bottom_y - top_y + 1e-6f);
-                float xL = top_left_x  + (bottom_left_x  - top_left_x)  * t;
-                float xR = top_right_x + (bottom_right_x - top_right_x) * t;
-
-                // 车道区域略微亮一点
-                if (x >= xL && x <= xR) {
-                    val = 0.2f;
-                }
-                // 左右车道线更亮
-                if (std::fabs(x - xL) < 2.0f || std::fabs(x - xR) < 2.0f) {
-                    val = 1.0f;
-                }
-            }
-
-            img[y * W + x] = val;
-        }
-    }
-}
-
-// ----------------- 预计算好的逆透视矩阵 H^{-1} -----------------
-// 这是 3x3 矩阵，把“相机视角图像”上的车道梯形映射到“鸟瞰矩形”
-// H_inv * [u; v; 1] = [x; y; w]，再用 (x/w, y/w) 去原图采样
-//
-// 这些系数是我提前用 4 对对应点算好的，假设输入大小 640x480、输出同尺寸。
+// ----------------- 常量内存：存储 H逆矩阵 -----------------
 __constant__ float d_Hinv[9];
 
-
-
-// __host__ void get_Hinv_host(float Hinv[9]) {
-//     // row-major: h00, h01, h02, h10, h11, h12, h20, h21, h22
-//     Hinv[0] = -0.6538462f;   Hinv[1] =  0.7005495f;   Hinv[2] = -336.2637363f;
-//     Hinv[3] =  0.0f;         Hinv[4] =  0.3969780f;   Hinv[5] = -471.7032967f;
-//     Hinv[6] =  0.0f;         Hinv[7] =  0.0023352f;   Hinv[8] = -1.7747253f;
-// }
+// ★★★ 请确保这里的数值是你用 Python 算出来的真实参数 ★★★
 __host__ void get_Hinv_host(float Hinv[9]) {
-    // 这里的数值是你刚刚用 Python 算出来的真实路面参数
+    // 示例数据，请用你 calibrated 出来的真实数据替换！
+    // 如果你还没有更新，请去 Python 脚本里复制
     Hinv[0] = 0.25004793f; Hinv[1] = -0.63625292f; Hinv[2] = 265.65849615f;
     Hinv[3] = 0.02820959f; Hinv[4] = -0.39842684f; Hinv[5] = 210.47166917f;
     Hinv[6] = 0.00011805f; Hinv[7] = -0.00193882f; Hinv[8] = 1.00000000f;
 }
 
-
-// ----------------- CPU 双线性插值采样 -----------------
-float bilinear_sample_cpu(const float *img, int W, int H,
-                          float x, float y) {
-    if (x < 0.0f || y < 0.0f || x > W - 1.0f || y > H - 1.0f) {
-        return 0.0f;
-    }
-    int x0 = static_cast<int>(std::floor(x));
-    int y0 = static_cast<int>(std::floor(y));
-    int x1 = std::min(x0 + 1, W - 1);
-    int y1 = std::min(y0 + 1, H - 1);
+// ----------------- 1. CPU 基线版本 -----------------
+float bilinear_sample_cpu(const float *img, int W, int H, float x, float y) {
+    if (x < 0.0f || y < 0.0f || x > W - 1.001f || y > H - 1.001f) return 0.0f;
+    int x0 = (int)x;
+    int y0 = (int)y;
+    int x1 = x0 + 1;
+    int y1 = y0 + 1;
     float dx = x - x0;
     float dy = y - y0;
+    // 简单的边界保护
+    if (x1 >= W) x1 = W - 1;
+    if (y1 >= H) y1 = H - 1;
 
     float v00 = img[y0 * W + x0];
     float v10 = img[y0 * W + x1];
     float v01 = img[y1 * W + x0];
     float v11 = img[y1 * W + x1];
-
-    float v0 = v00 + dx * (v10 - v00);
-    float v1 = v01 + dx * (v11 - v01);
-    return v0 + dy * (v1 - v0);
+    return (1 - dy) * ((1 - dx) * v00 + dx * v10) + dy * ((1 - dx) * v01 + dx * v11);
 }
 
-// ----------------- CPU 逆透视 -----------------
-void ipm_cpu(const float *src, float *dst,
-             int inW, int inH, int outW, int outH,
-             const float Hinv[9]) {
+void ipm_cpu(const float *src, float *dst, int inW, int inH, int outW, int outH, const float Hinv[9]) {
     for (int v = 0; v < outH; ++v) {
         for (int u = 0; u < outW; ++u) {
-            float U = static_cast<float>(u);
-            float V = static_cast<float>(v);
-
-            float x = Hinv[0] * U + Hinv[1] * V + Hinv[2];
-            float y = Hinv[3] * U + Hinv[4] * V + Hinv[5];
-            float w = Hinv[6] * U + Hinv[7] * V + Hinv[8];
-
+            float x = Hinv[0] * u + Hinv[1] * v + Hinv[2];
+            float y = Hinv[3] * u + Hinv[4] * v + Hinv[5];
+            float w = Hinv[6] * u + Hinv[7] * v + Hinv[8];
             float src_x = x / w;
             float src_y = y / w;
-
             dst[v * outW + u] = bilinear_sample_cpu(src, inW, inH, src_x, src_y);
         }
     }
 }
 
-// ----------------- GPU 版本：双线性插值 -----------------
-__device__ float bilinear_sample_gpu(const float *img,
-                                     int W, int H,
-                                     float x, float y) {
-    if (x < 0.0f || y < 0.0f || x > W - 1.0f || y > H - 1.0f) {
-        return 0.0f;
-    }
-    int x0 = (int)floorf(x);
-    int y0 = (int)floorf(y);
+// ----------------- 2. GPU 版本 A: 全局内存 (Global Memory) -----------------
+__device__ float bilinear_sample_gpu_manual(const float *img, int W, int H, float x, float y) {
+    if (x < 0.0f || y < 0.0f || x > W - 1.001f || y > H - 1.001f) return 0.0f;
+    int x0 = (int)x;
+    int y0 = (int)y;
     int x1 = min(x0 + 1, W - 1);
     int y1 = min(y0 + 1, H - 1);
     float dx = x - x0;
     float dy = y - y0;
-
     float v00 = img[y0 * W + x0];
     float v10 = img[y0 * W + x1];
     float v01 = img[y1 * W + x0];
     float v11 = img[y1 * W + x1];
-
-    float v0 = v00 + dx * (v10 - v00);
-    float v1 = v01 + dx * (v11 - v01);
-    return v0 + dy * (v1 - v0);
+    return (1 - dy) * ((1 - dx) * v00 + dx * v10) + dy * ((1 - dx) * v01 + dx * v11);
 }
 
-// ----------------- GPU kernel：每个线程负责一个输出像素 -----------------
-__global__ void ipm_kernel(const float *src, float *dst,
-                           int inW, int inH, int outW, int outH) {
+__global__ void ipm_kernel_global(const float *src, float *dst, int inW, int inH, int outW, int outH) {
     int u = blockIdx.x * blockDim.x + threadIdx.x;
     int v = blockIdx.y * blockDim.y + threadIdx.y;
     if (u >= outW || v >= outH) return;
 
-    float U = (float)u;
-    float V = (float)v;
+    float x = d_Hinv[0] * u + d_Hinv[1] * v + d_Hinv[2];
+    float y = d_Hinv[3] * u + d_Hinv[4] * v + d_Hinv[5];
+    float w = d_Hinv[6] * u + d_Hinv[7] * v + d_Hinv[8];
 
-    float x = d_Hinv[0] * U + d_Hinv[1] * V + d_Hinv[2];
-    float y = d_Hinv[3] * U + d_Hinv[4] * V + d_Hinv[5];
-    float w = d_Hinv[6] * U + d_Hinv[7] * V + d_Hinv[8];
+    float src_x = x / w;
+    float src_y = y / w;
+    dst[v * outW + u] = bilinear_sample_gpu_manual(src, inW, inH, src_x, src_y);
+}
+
+// ----------------- 3. GPU 版本 B: 纹理内存 (Texture Memory) -----------------
+// 优势：
+// 1. 利用 Texture Cache，针对 2D 空间局部性优化，缓解非合并访存压力。
+// 2. 利用硬件插值单元 (Texture Unit)，不占用 CUDA Core 计算资源。
+// 3. 自动处理边界 (Border Mode)。
+__global__ void ipm_kernel_texture(cudaTextureObject_t tex, float *dst, int outW, int outH) {
+    int u = blockIdx.x * blockDim.x + threadIdx.x;
+    int v = blockIdx.y * blockDim.y + threadIdx.y;
+    if (u >= outW || v >= outH) return;
+
+    // 坐标变换逻辑完全一致
+    float x = d_Hinv[0] * u + d_Hinv[1] * v + d_Hinv[2];
+    float y = d_Hinv[3] * u + d_Hinv[4] * v + d_Hinv[5];
+    float w = d_Hinv[6] * u + d_Hinv[7] * v + d_Hinv[8];
 
     float src_x = x / w;
     float src_y = y / w;
 
-    float val = bilinear_sample_gpu(src, inW, inH, src_x, src_y);
-    dst[v * outW + u] = val;
+    // 直接采样！
+    // 注意：tex2D 使用非归一化坐标时，像素中心通常建议偏移 +0.5f 以获得最精确对齐
+    // 越界部分会自动变为 0 (由 cudaAddressModeBorder 决定)
+    dst[v * outW + u] = tex2D<float>(tex, src_x + 0.5f, src_y + 0.5f);
 }
 
 int main() {
-    // const int inW  = 640;
-    // const int inH  = 480;
-    // const int outW = 640;
-    // const int outH = 480;
-
-    // std::cout << "=== CUDA IPM (Inverse Perspective Mapping) Experiment ===\n";
-    // std::cout << "Input size  : " << inW  << " x " << inH  << "\n";
-    // std::cout << "Output size : " << outW << " x " << outH << "\n";
-
-    // // 1. Host 内存
-    // std::vector<float> h_input(inW * inH);
-    // std::vector<float> h_ipm_cpu(outW * outH);
-    // std::vector<float> h_ipm_gpu(outW * outH);
-
-    // // 2. 生成合成道路图
-    // generate_synthetic_road(h_input.data(), inW, inH);
-    // save_pgm("input.pgm", h_input.data(), inW, inH);
-    int inW = 0, inH = 0;
-    int outW = 0, outH = 0;
-
-    // 1. 从 input.pgm 读入灰度图
+    // 1. 读取输入
+    int inW, inH;
     std::vector<float> h_input;
     if (!load_pgm("input.pgm", h_input, inW, inH)) {
-        std::cerr << "Failed to load input.pgm, 请先用 Python 生成它\n";
+        std::cerr << "Error: Cannot load input.pgm\n";
         return 1;
     }
-    outW = inW;
-    outH = inH;
+    int outW = inW, outH = inH;
 
-    std::cout << "=== CUDA IPM (Inverse Perspective Mapping) Experiment ===\n";
-    std::cout << "Input size  : " << inW  << " x " << inH  << "\n";
-    std::cout << "Output size : " << outW << " x " << outH << "\n";
+    std::cout << "=== IPM Optimization Experiment ===\n";
+    std::cout << "Image Size: " << inW << " x " << inH << "\n";
 
+    // 2. 准备输出缓冲区
     std::vector<float> h_ipm_cpu(outW * outH);
-    std::vector<float> h_ipm_gpu(outW * outH);
+    std::vector<float> h_ipm_gpu_global(outW * outH);
+    std::vector<float> h_ipm_gpu_tex(outW * outH);
 
-    // （注意：这里不要再调用 generate_synthetic_road 了）
-
-    // 3. 准备 H^{-1}，拷贝到 constant memory
+    // 3. 拷贝矩阵到常量内存
     float Hinv_host[9];
     get_Hinv_host(Hinv_host);
     CHECK_CUDA(cudaMemcpyToSymbol(d_Hinv, Hinv_host, 9 * sizeof(float)));
 
-    // 4. CPU 计算 + 计时
-    auto t0 = std::chrono::high_resolution_clock::now();
-    ipm_cpu(h_input.data(), h_ipm_cpu.data(),
-            inW, inH, outW, outH, Hinv_host);
-    auto t1 = std::chrono::high_resolution_clock::now();
-    double cpu_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    // ★★★ 修复点：在这里定义 dt，让它在整个 main 函数可见
+    double dt = 0.0;
 
-    // 5. GPU 计算
-    float *d_input = nullptr;
-    float *d_output = nullptr;
-    CHECK_CUDA(cudaMalloc(&d_input,  inW * inH  * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&d_output, outW * outH * sizeof(float)));
-    CHECK_CUDA(cudaMemcpy(d_input, h_input.data(),
-                          inW * inH * sizeof(float),
-                          cudaMemcpyHostToDevice));
-
-    dim3 block(16, 16);
-    dim3 grid((outW + block.x - 1) / block.x,
-              (outH + block.y - 1) / block.y);
-
-    cudaEvent_t start, stop;
-    CHECK_CUDA(cudaEventCreate(&start));
-    CHECK_CUDA(cudaEventCreate(&stop));
-
-    CHECK_CUDA(cudaEventRecord(start));
-    ipm_kernel<<<grid, block>>>(d_input, d_output,
-                                inW, inH, outW, outH);
-    CHECK_CUDA(cudaEventRecord(stop));
-    CHECK_CUDA(cudaEventSynchronize(stop));
-
-    float gpu_ms = 0.0f;
-    CHECK_CUDA(cudaEventElapsedTime(&gpu_ms, start, stop));
-
-    CHECK_CUDA(cudaMemcpy(h_ipm_gpu.data(), d_output,
-                          outW * outH * sizeof(float),
-                          cudaMemcpyDeviceToHost));
-
-    // 6. 误差与加速比
-    float max_err = 0.0f;
-    for (int i = 0; i < outW * outH; ++i) {
-        float e = std::fabs(h_ipm_cpu[i] - h_ipm_gpu[i]);
-        if (e > max_err) max_err = e;
+    // ==========================================
+    // Part 1: CPU Baseline
+    // ==========================================
+    {
+        auto t0 = std::chrono::high_resolution_clock::now();
+        ipm_cpu(h_input.data(), h_ipm_cpu.data(), inW, inH, outW, outH, Hinv_host);
+        auto t1 = std::chrono::high_resolution_clock::now();
+        // ★★★ 修复点：去掉前面的 double
+        dt = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::cout << "[CPU] Time: " << dt << " ms\n";
+        save_pgm("ipm_result_cpu.pgm", h_ipm_cpu.data(), outW, outH);
     }
 
-    double speedup = cpu_ms / gpu_ms;
+    // ==========================================
+    // Part 2: GPU (Global Memory + Manual Interpolation)
+    // ==========================================
+    float *d_input, *d_output_global;
+    CHECK_CUDA(cudaMalloc(&d_input, inW * inH * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&d_output_global, outW * outH * sizeof(float)));
+    CHECK_CUDA(cudaMemcpy(d_input, h_input.data(), inW * inH * sizeof(float), cudaMemcpyHostToDevice));
 
-    std::cout << "[CPU ] IPM time = " << cpu_ms << " ms\n";
-    std::cout << "[GPU ] IPM time = " << gpu_ms << " ms\n";
-    std::cout << "Speedup S_p    = " << speedup << "\n";
-    std::cout << "Max abs diff   = " << max_err << "\n";
+    dim3 block(16, 16);
+    dim3 grid((outW + block.x - 1) / block.x, (outH + block.y - 1) / block.y);
 
-    // 7. 存结果图像
-    save_pgm("ipm_cpu.pgm", h_ipm_cpu.data(), outW, outH);
-    save_pgm("ipm_gpu.pgm", h_ipm_gpu.data(), outW, outH);
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start); cudaEventCreate(&stop);
 
+    cudaEventRecord(start);
+    ipm_kernel_global<<<grid, block>>>(d_input, d_output_global, inW, inH, outW, outH);
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+
+    float ms_global = 0;
+    cudaEventElapsedTime(&ms_global, start, stop);
+    std::cout << "[GPU Global] Time: " << ms_global << " ms\n";
+    
+    CHECK_CUDA(cudaMemcpy(h_ipm_gpu_global.data(), d_output_global, outW * outH * sizeof(float), cudaMemcpyDeviceToHost));
+    save_pgm("ipm_result_gpu_global.pgm", h_ipm_gpu_global.data(), outW, outH);
+    
+    // ==========================================
+    // Part 3: GPU (Texture Memory + Hardware Interpolation)
+    // ==========================================
+    cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc(32, 0, 0, 0, cudaChannelFormatKindFloat);
+    cudaArray* cuArray;
+    CHECK_CUDA(cudaMallocArray(&cuArray, &channelDesc, inW, inH));
+    CHECK_CUDA(cudaMemcpyToArray(cuArray, 0, 0, h_input.data(), inW * inH * sizeof(float), cudaMemcpyHostToDevice));
+
+    struct cudaResourceDesc resDesc;
+    memset(&resDesc, 0, sizeof(resDesc));
+    resDesc.resType = cudaResourceTypeArray;
+    resDesc.res.array.array = cuArray;
+
+    struct cudaTextureDesc texDesc;
+    memset(&texDesc, 0, sizeof(texDesc));
+    texDesc.addressMode[0]   = cudaAddressModeBorder;
+    texDesc.addressMode[1]   = cudaAddressModeBorder;
+    texDesc.filterMode       = cudaFilterModeLinear;
+    texDesc.readMode         = cudaReadModeElementType;
+    texDesc.normalizedCoords = 0;
+
+    cudaTextureObject_t texObj = 0;
+    CHECK_CUDA(cudaCreateTextureObject(&texObj, &resDesc, &texDesc, NULL));
+
+    float *d_output_tex = d_output_global; 
+
+    cudaEventRecord(start);
+    ipm_kernel_texture<<<grid, block>>>(texObj, d_output_tex, outW, outH);
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+
+    float ms_tex = 0;
+    cudaEventElapsedTime(&ms_tex, start, stop);
+    std::cout << "[GPU Texture] Time: " << ms_tex << " ms\n";
+
+    CHECK_CUDA(cudaMemcpy(h_ipm_gpu_tex.data(), d_output_tex, outW * outH * sizeof(float), cudaMemcpyDeviceToHost));
+    save_pgm("ipm_result_gpu_tex.pgm", h_ipm_gpu_tex.data(), outW, outH);
+
+    // ==========================================
+    // 结果分析
+    // ==========================================
+    std::cout << "------------------------------------------------\n";
+    std::cout << "Speedup (CPU vs Global) : " << dt / ms_global << " x\n";
+    std::cout << "Speedup (CPU vs Texture): " << dt / ms_tex << " x\n";
+    std::cout << "Improvement (Global vs Texture): " << (ms_global - ms_tex) / ms_global * 100.0f << " %\n";
+
+    CHECK_CUDA(cudaDestroyTextureObject(texObj));
+    CHECK_CUDA(cudaFreeArray(cuArray));
     CHECK_CUDA(cudaFree(d_input));
-    CHECK_CUDA(cudaFree(d_output));
+    CHECK_CUDA(cudaFree(d_output_global));
     CHECK_CUDA(cudaEventDestroy(start));
     CHECK_CUDA(cudaEventDestroy(stop));
 
-    std::cout << "Saved input.pgm, ipm_cpu.pgm, ipm_gpu.pgm\n";
     return 0;
 }
